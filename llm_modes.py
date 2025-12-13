@@ -24,6 +24,11 @@ Rules:
 - Stage meta: write session_schema.json and print templates.
 - Stage game: generate play_game.py logic accordingly.
 Output ONLY the Python code, no markdown, no commentary.
+All files written by generated Python code MUST be written relative to the
+directory containing the generated file:
+BASE_DIR = Path(__file__).resolve().parent
+Never write files relative to the current working directory.
+Do not print the DSL/templates to stdout. Write them to dsl_doc.txt in the same directory as the generated file.
 """
 
 REPAIR_SYSTEM = """You are a compiler repair backend.
