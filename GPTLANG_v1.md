@@ -231,10 +231,10 @@ max_runtime_s: 15
 
 ### 3) Compile
 
-From your repo root (where `gptlang_compile.py` lives):
+From your repo root (where `cllam.py` lives):
 
 ```bash
-python gptlang_compile.py my_game/
+python cllam.py my_game/
 ```
 
 If valid, you will get:
