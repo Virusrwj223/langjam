@@ -1,711 +1,391 @@
 # gptlang_validate.py
+# Deterministic validator for GPTLANG v1.
+# Consumes Program AST (from gptlang_parse) and checks:
+#   - required blocks present
+#   - required keys present
+#   - type checks (ValueKind)
+#   - enum checks
+#   - int range checks
+#   - non-empty checks (string/list)
+#   - list item kind + item enum checks
+#   - conditional requirements (loop => tick_ms/max_turns)
+#   - simple compatibility constraints (render=pygame policy, no_network policy if present)
+#
+# Produces CompilationResult with ok + diagnostics (+ ast if ok).
+
 from __future__ import annotations
 
-from dataclasses import asdict
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 from gptlang_ast import (
-    BlockStmt,
-    CanonKey,
-    CanonSection,
-    FieldStmt,
-    File,
-    Section,
-    Span,
-    Statement,
-    StmtKind,
+    Program,
+    Block,
+    KeyValue,
     Value,
     ValueKind,
-    VBool,
-    VIdent,
-    VInt,
-    VList,
-    VObject,
-    VString,
+    Diagnostic,
+    Severity,
+    CompilationResult,
+    Err,
+    Schema,
+    GPTLANG_V1_SCHEMA,
+    BlockSpec,
+    FieldSpec,
+    Range,
+    field_spec_map,
+    expected_fields,
 )
 
-# ============================================================
-# 0) Diagnostic JSON helpers
-# ============================================================
 
-def span_to_json(span: Span) -> Dict[str, int]:
-    return {
-        "line": span.start.line,
-        "col": span.start.col,
-        "endLine": span.end.line,
-        "endCol": span.end.col,
-        "index": span.start.index,
-        "endIndex": span.end.index,
-    }
+def _span_of_block_or_program(block: Optional[Block]) -> Optional[object]:
+    if block is None:
+        return None
+    return block.header_span
 
 
-def diag_json(
+def _diag(
     code: str,
     message: str,
-    span: Span,
-    severity: str = "error",
-    context: Optional[Dict[str, Any]] = None,
-    suggestions: Optional[List[Dict[str, str]]] = None,
-) -> Dict[str, Any]:
-    return {
-        "code": code,
-        "severity": severity,
-        "message": message,
-        "span": span_to_json(span),
-        "context": context or {},
-        "suggestions": suggestions or [],
-    }
-
-
-def result_json(
-    ok: bool,
-    stage: str,
-    file: str,
-    diagnostics: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    return {
-        "ok": ok,
-        "stage": stage,
-        "file": file,
-        "diagnostics": diagnostics,
-    }
-
-
-# ============================================================
-# 1) AST indexing helpers
-# ============================================================
-
-def index_sections(ast: File) -> Dict[str, Section]:
-    # Map by canonical section name. If multiple unknown/custom sections appear,
-    # only last wins; duplicates should already be parse errors, but we stay safe.
-    out: Dict[str, Section] = {}
-    for s in ast.sections:
-        out[s.name.canon] = s
-    return out
-
-
-def index_fields(sec: Section) -> Dict[str, FieldStmt]:
-    out: Dict[str, FieldStmt] = {}
-    for st in sec.body:
-        if st.kind == StmtKind.FIELD:
-            fs = st.value  # type: ignore[assignment]
-            assert isinstance(fs, FieldStmt)
-            out[fs.key.canon] = fs
-    return out
-
-
-def index_blocks(sec: Section) -> Dict[str, BlockStmt]:
-    out: Dict[str, BlockStmt] = {}
-    for st in sec.body:
-        if st.kind == StmtKind.BLOCK:
-            bs = st.value  # type: ignore[assignment]
-            assert isinstance(bs, BlockStmt)
-            out[bs.key.canon] = bs
-    return out
-
-
-def file_span(ast: File) -> Span:
-    # Best-effort: span from first to last section
-    if not ast.sections:
-        # dummy span (caller should never validate an empty parsed file in practice)
-        from gptlang_ast import Position
-        p = Position(1, 1, 0)
-        return Span(p, p)
-    return Span(ast.sections[0].span.start, ast.sections[-1].span.end)
-
-
-# ============================================================
-# 2) Value checks (type, enum, range, non-empty list, etc.)
-# ============================================================
-
-def is_ident_value(v: Value) -> bool:
-    return v.kind == ValueKind.IDENT
-
-def is_string_value(v: Value) -> bool:
-    return v.kind == ValueKind.STRING
-
-def is_int_value(v: Value) -> bool:
-    return v.kind == ValueKind.INT
-
-def is_bool_value(v: Value) -> bool:
-    return v.kind == ValueKind.BOOL
-
-def is_list_value(v: Value) -> bool:
-    return v.kind == ValueKind.LIST
-
-def get_ident(v: Value) -> Optional[str]:
-    if v.kind == ValueKind.IDENT:
-        return v.value.name  # type: ignore[attr-defined]
-    return None
-
-def get_string(v: Value) -> Optional[str]:
-    if v.kind == ValueKind.STRING:
-        return v.value.text  # type: ignore[attr-defined]
-    return None
-
-def get_int(v: Value) -> Optional[int]:
-    if v.kind == ValueKind.INT:
-        return v.value.n  # type: ignore[attr-defined]
-    return None
-
-def get_bool(v: Value) -> Optional[bool]:
-    if v.kind == ValueKind.BOOL:
-        return v.value.b  # type: ignore[attr-defined]
-    return None
-
-def get_list(v: Value) -> Optional[List[Value]]:
-    if v.kind == ValueKind.LIST:
-        return v.value.items  # type: ignore[attr-defined]
-    return None
-
-
-def expect_type(
-    diags: List[Dict[str, Any]],
-    v: Value,
-    expected: str,
-) -> bool:
-    """
-    expected in {"string","int","bool","ident","list","object"}
-    """
-    kind_map = {
-        "string": ValueKind.STRING,
-        "int": ValueKind.INT,
-        "bool": ValueKind.BOOL,
-        "ident": ValueKind.IDENT,
-        "list": ValueKind.LIST,
-        "object": ValueKind.OBJECT,
-    }
-    ek = kind_map[expected]
-    if v.kind != ek:
-        diags.append(diag_json(
-            "E1003",
-            f"Type mismatch: expected {expected}, found {v.kind.value}",
-            v.span,
-            context={"expected": expected, "found": v.kind.value},
-        ))
-        return False
-    return True
-
-
-def expect_enum_ident(
-    diags: List[Dict[str, Any]],
-    v: Value,
-    allowed: List[str],
-) -> bool:
-    if not expect_type(diags, v, "ident"):
-        return False
-    val = get_ident(v)
-    if val not in allowed:
-        diags.append(diag_json(
-            "E1004",
-            f"Invalid enum value: {val!r} (allowed: {allowed})",
-            v.span,
-            context={"allowed": allowed, "found": val},
-        ))
-        return False
-    return True
-
-
-def expect_int_range(
-    diags: List[Dict[str, Any]],
-    v: Value,
-    lo: int,
-    hi: int,
-) -> bool:
-    if not expect_type(diags, v, "int"):
-        return False
-    n = get_int(v)
-    assert n is not None
-    if n < lo or n > hi:
-        diags.append(diag_json(
-            "E1005",
-            f"Integer out of range: {n} not in [{lo}, {hi}]",
-            v.span,
-            context={"min": lo, "max": hi, "found": n},
-        ))
-        return False
-    return True
-
-
-def expect_nonempty_list_of_idents(
-    diags: List[Dict[str, Any]],
-    v: Value,
-) -> Optional[List[str]]:
-    if not expect_type(diags, v, "list"):
-        return None
-    items = get_list(v) or []
-    if len(items) == 0:
-        diags.append(diag_json(
-            "E1006",
-            "List must be non-empty",
-            v.span,
-        ))
-        return None
-
-    out: List[str] = []
-    for it in items:
-        if it.kind != ValueKind.IDENT:
-            diags.append(diag_json(
-                "E1003",
-                f"List element type mismatch: expected ident, found {it.kind.value}",
-                it.span,
-                context={"expected_elem": "ident", "found_elem": it.kind.value},
-            ))
-            continue
-        out.append(it.value.name)  # type: ignore[attr-defined]
-    return out
-
-
-# ============================================================
-# 3) validate_main_v1(ast)
-# ============================================================
-
-def validate_main_v1(ast: File, source_name: str = "main.llm") -> Dict[str, Any]:
-    diags: List[Dict[str, Any]] = []
-    secs = index_sections(ast)
-
-    # ---- required sections (canonical) ----
-    required_sections = [
-        CanonSection.INTENT.value,
-        CanonSection.WORLD.value,
-        CanonSection.MECHANICS.value,
-        CanonSection.OUTPUT.value,
-    ]
-    for sec_name in required_sections:
-        if sec_name not in secs:
-            diags.append(diag_json(
-                "E1002",
-                f"Missing required section @{sec_name}",
-                file_span(ast),
-                context={"expected": required_sections, "found": [s.name.canon for s in ast.sections]},
-                suggestions=[{
-                    "title": f"Add @{sec_name} section template",
-                    "patch": _main_section_template(sec_name),
-                }],
-            ))
-
-    # If critical sections missing, we still continue to report more, but
-    # some checks depend on them existing.
-    # ---- INTENT ----
-    intent = secs.get(CanonSection.INTENT.value)
-    if intent:
-        fields = index_fields(intent)
-
-        _require_field(diags, intent, fields, CanonKey.NAME.value, expected="string")
-        _require_field(diags, intent, fields, CanonKey.VERSION.value, expected="int")
-        _require_field(diags, intent, fields, CanonKey.STAGE.value, expected="ident")
-
-        # version must be 1
-        if CanonKey.VERSION.value in fields:
-            v = fields[CanonKey.VERSION.value].value
-            if expect_type(diags, v, "int"):
-                n = get_int(v)
-                if n != 1:
-                    diags.append(diag_json(
-                        "E1004",
-                        f"Invalid version: expected 1, found {n}",
-                        v.span,
-                        context={"expected": 1, "found": n},
-                        suggestions=[{"title": "Set patch/version to 1", "patch": "patch: 1;"}],
-                    ))
-
-        # stage must be meta
-        if CanonKey.STAGE.value in fields:
-            v = fields[CanonKey.STAGE.value].value
-            expect_enum_ident(diags, v, allowed=["meta"])
-
-    # ---- WORLD ----
-    world = secs.get(CanonSection.WORLD.value)
-    assets: List[str] = []
-    if world:
-        fields = index_fields(world)
-        _require_field(diags, world, fields, CanonKey.SETTING.value, expected="string")
-        _require_field(diags, world, fields, CanonKey.ASSETS.value, expected="list")
-
-        if CanonKey.ASSETS.value in fields:
-            v = fields[CanonKey.ASSETS.value].value
-            got = expect_nonempty_list_of_idents(diags, v)
-            if got is not None:
-                assets = got
-
-    # ---- MECHANICS ----
-    mech = secs.get(CanonSection.MECHANICS.value)
-    if mech:
-        fields = index_fields(mech)
-        _require_field(diags, mech, fields, CanonKey.TURNS.value, expected="int")
-        _require_field(diags, mech, fields, CanonKey.ACTIONS.value, expected="list")
-        _require_field(diags, mech, fields, CanonKey.WIN_CONDITION.value, expected="string")
-
-        if CanonKey.TURNS.value in fields:
-            expect_int_range(diags, fields[CanonKey.TURNS.value].value, lo=1, hi=10_000)
-
-        if CanonKey.ACTIONS.value in fields:
-            actions = expect_nonempty_list_of_idents(diags, fields[CanonKey.ACTIONS.value].value)
-            # optional: actions must be unique
-            if actions:
-                dupes = sorted({a for a in actions if actions.count(a) > 1})
-                if dupes:
-                    diags.append(diag_json(
-                        "E1004",
-                        f"Duplicate actions not allowed: {dupes}",
-                        fields[CanonKey.ACTIONS.value].value.span,
-                        context={"duplicates": dupes},
-                    ))
-
-    # ---- OUTPUT ----
-    out = secs.get(CanonSection.OUTPUT.value)
-    if out:
-        fields = index_fields(out)
-        _require_field(diags, out, fields, CanonKey.DSL_NAME.value, expected="ident")
-        _require_field(diags, out, fields, CanonKey.EMIT_TEMPLATES.value, expected="bool")
-
-    ok = not any(d["severity"] == "error" for d in diags)
-    return result_json(ok=ok, stage="validate", file=source_name, diagnostics=diags)
-
-
-def _require_field(
-    diags: List[Dict[str, Any]],
-    sec: Section,
-    fields: Dict[str, FieldStmt],
-    key_canon: str,
-    expected: Optional[str] = None,
-) -> None:
-    if key_canon not in fields:
-        diags.append(diag_json(
-            "E1001",
-            f"Missing required field '{key_canon}' in section @{sec.name.raw}",
-            sec.span,
-            context={"section": sec.name.raw, "missing": key_canon},
-            suggestions=[{
-                "title": f"Add field '{key_canon}'",
-                "patch": _field_patch_example(sec.name.canon, key_canon),
-            }],
-        ))
-        return
-    if expected is not None:
-        expect_type(diags, fields[key_canon].value, expected)
-
-
-def _main_section_template(sec_canon: str) -> str:
-    # canonical templates; slang mapping happens at the surface, but patch can be canonical too.
-    if sec_canon == CanonSection.INTENT.value:
-        return "@VIBE_CHECK {\n  title: \"...\";\n  patch: 1;\n  mode: meta;\n}\n"
-    if sec_canon == CanonSection.WORLD.value:
-        return "@WORLD_BUILD {\n  setting: \"...\";\n  loot: [ASSET1];\n}\n"
-    if sec_canon == CanonSection.MECHANICS.value:
-        return "@HOW_IT_HITS {\n  turns: 100;\n  moves: [move1];\n  dub_condition: \"...\";\n}\n"
-    if sec_canon == CanonSection.OUTPUT.value:
-        return "@SHIP_IT {\n  session_dsl: SessionDSL;\n  print_templates: true;\n}\n"
-    return f"@{sec_canon} {{\n}}\n"
-
-
-def _field_patch_example(section_canon: str, key_canon: str) -> str:
-    # Prefer slang patches for user-facing experience.
-    # Minimal v1 cases:
-    if section_canon == CanonSection.INTENT.value:
-        if key_canon == CanonKey.NAME.value:
-            return 'title: "My Game";'
-        if key_canon == CanonKey.VERSION.value:
-            return "patch: 1;"
-        if key_canon == CanonKey.STAGE.value:
-            return "mode: meta;"
-    if section_canon == CanonSection.WORLD.value:
-        if key_canon == CanonKey.SETTING.value:
-            return 'setting: "neon city";'
-        if key_canon == CanonKey.ASSETS.value:
-            return "loot: [BTC];"
-    if section_canon == CanonSection.MECHANICS.value:
-        if key_canon == CanonKey.TURNS.value:
-            return "turns: 50;"
-        if key_canon == CanonKey.ACTIONS.value:
-            return "moves: [trade];"
-        if key_canon == CanonKey.WIN_CONDITION.value:
-            return 'dub_condition: "profit max";'
-    if section_canon == CanonSection.OUTPUT.value:
-        if key_canon == CanonKey.DSL_NAME.value:
-            return "session_dsl: MySessionDSL;"
-        if key_canon == CanonKey.EMIT_TEMPLATES.value:
-            return "print_templates: true;"
-    # fallback
-    return f"{key_canon}: ...;"
-
-
-# ============================================================
-# 4) validate_game_v1(ast, session_schema)
-# ============================================================
-
-# A realistic minimal schema you can generate from Stage A:
-# session_schema = {
-#   "dsl_name": "VibeExchangeSession",
-#   "program": {
-#       "required_block": "strategy",           # canonical
-#       "block_schema": {
-#           "required": {
-#               "asset": {"type": "ident", "in": ["BTC", "ETH"]},
-#               "risk":  {"type": "ident", "enum": ["low", "med", "high"]},
-#           },
-#           "optional": {
-#               "rule":  {"type": "string"},
-#           },
-#           "strict_unknown_keys": False
-#       }
-#   }
-# }
-
-def validate_game_v1(
-    ast: File,
-    session_schema: Dict[str, Any],
-    source_name: str = "game1.llm",
-) -> Dict[str, Any]:
-    diags: List[Dict[str, Any]] = []
-    secs = index_sections(ast)
-
-    # Required: PROGRAM section (slang: @PLAYBOOK)
-    prog = secs.get(CanonSection.PROGRAM.value)
-    if not prog:
-        diags.append(diag_json(
-            "E1002",
-            "Missing required section @PROGRAM (slang: @PLAYBOOK)",
-            file_span(ast),
-            suggestions=[{
-                "title": "Add @PLAYBOOK template",
-                "patch": _game_playbook_template(session_schema),
-            }],
-        ))
-        ok = False
-        return result_json(ok=ok, stage="validate", file=source_name, diagnostics=diags)
-
-    # Validate PROGRAM fields
-    prog_fields = index_fields(prog)
-    prog_blocks = index_blocks(prog)
-
-    # 1) dsl must match schema["dsl_name"]
-    expected_dsl = session_schema.get("dsl_name")
-    if CanonKey.DSL.value not in prog_fields:
-        diags.append(diag_json(
-            "E1001",
-            f"Missing required field '{CanonKey.DSL.value}' in @PLAYBOOK",
-            prog.span,
-            suggestions=[{"title": "Set session_dsl", "patch": f"session_dsl: {expected_dsl};"}] if expected_dsl else [],
-        ))
-    else:
-        v = prog_fields[CanonKey.DSL.value].value
-        if expect_type(diags, v, "ident"):
-            got = get_ident(v)
-            if expected_dsl is not None and got != expected_dsl:
-                diags.append(diag_json(
-                    "E2002",
-                    f"DSL mismatch: expected {expected_dsl}, found {got}",
-                    v.span,
-                    context={"expected": expected_dsl, "found": got},
-                    suggestions=[{"title": "Fix DSL name", "patch": f"session_dsl: {expected_dsl};"}],
-                ))
-
-    # 2) required block (canonical "strategy") exists (slang: gameplan)
-    program_spec = session_schema.get("program", {})
-    required_block_canon = program_spec.get("required_block", CanonKey.STRATEGY.value)
-
-    if required_block_canon not in prog_blocks:
-        diags.append(diag_json(
-            "E1001",
-            f"Missing required block '{required_block_canon}' in @PLAYBOOK (slang: gameplan)",
-            prog.span,
-            suggestions=[{"title": "Add gameplan block", "patch": _gameplan_template(session_schema)}],
-        ))
-        ok = not any(d["severity"] == "error" for d in diags)
-        return result_json(ok=ok, stage="validate", file=source_name, diagnostics=diags)
-
-    strategy = prog_blocks[required_block_canon]
-    block_schema = program_spec.get("block_schema", {})
-    _validate_block_against_schema(diags, strategy, block_schema)
-
-    ok = not any(d["severity"] == "error" for d in diags)
-    return result_json(ok=ok, stage="validate", file=source_name, diagnostics=diags)
-
-
-def _validate_block_against_schema(
-    diags: List[Dict[str, Any]],
-    block: BlockStmt,
-    schema: Dict[str, Any],
-) -> None:
-    """
-    schema shape:
-    {
-      "required": { key: { "type": "...", "enum": [...], "in": [...] , "min":..,"max":..,"nonempty":.. } },
-      "optional": { ... },
-      "strict_unknown_keys": bool
-    }
-    """
-    required: Dict[str, Any] = schema.get("required", {})
-    optional: Dict[str, Any] = schema.get("optional", {})
-    strict_unknown = bool(schema.get("strict_unknown_keys", False))
-
-    # index by canonical key (already canon_key-mapped by parser)
-    fields_by_canon: Dict[str, FieldStmt] = {f.key.canon: f for f in block.fields}
-
-    # required keys present
-    for key_canon, spec in required.items():
-        if key_canon not in fields_by_canon:
-            diags.append(diag_json(
-                "E1001",
-                f"Missing required field '{key_canon}' in block {block.key.raw}",
-                block.span,
-                context={"block": block.key.raw, "missing": key_canon},
-                suggestions=[{"title": f"Add '{key_canon}'", "patch": _schema_field_patch(key_canon, spec)}],
-            ))
-        else:
-            _validate_value_against_spec(diags, fields_by_canon[key_canon].value, spec)
-
-    # optional keys: if present, validate
-    for key_canon, spec in optional.items():
-        if key_canon in fields_by_canon:
-            _validate_value_against_spec(diags, fields_by_canon[key_canon].value, spec)
-
-    # unknown keys (if strict)
-    if strict_unknown:
-        allowed = set(required.keys()) | set(optional.keys())
-        for k in fields_by_canon.keys():
-            if k not in allowed:
-                diags.append(diag_json(
-                    "E1007",
-                    f"Unknown key '{k}' in block {block.key.raw}",
-                    fields_by_canon[k].span,
-                    severity="error",
-                    context={"allowed": sorted(list(allowed)), "found": k},
-                ))
-
-
-def _validate_value_against_spec(
-    diags: List[Dict[str, Any]],
-    v: Value,
-    spec: Dict[str, Any],
-) -> None:
-    ty = spec.get("type")
-    if ty:
-        if not expect_type(diags, v, ty):
-            return
-
-    # enum for ident
-    if "enum" in spec:
-        allowed = list(spec["enum"])
-        expect_enum_ident(diags, v, allowed=allowed)
-
-    # membership constraint (for ident/string typically)
-    if "in" in spec:
-        allowed = list(spec["in"])
-        if v.kind == ValueKind.IDENT:
-            got = get_ident(v)
-        elif v.kind == ValueKind.STRING:
-            got = get_string(v)
-        else:
-            got = None
-
-        if got is None or got not in allowed:
-            diags.append(diag_json(
-                "E2001",
-                f"Value {got!r} not allowed (expected one of {allowed})",
-                v.span,
-                context={"allowed": allowed, "found": got},
-            ))
-
-    # numeric range
-    if v.kind == ValueKind.INT and ("min" in spec or "max" in spec):
-        lo = int(spec.get("min", -2**31))
-        hi = int(spec.get("max", 2**31 - 1))
-        expect_int_range(diags, v, lo=lo, hi=hi)
-
-    # list constraints
-    if v.kind == ValueKind.LIST and spec.get("nonempty") is True:
-        items = get_list(v) or []
-        if len(items) == 0:
-            diags.append(diag_json("E1006", "List must be non-empty", v.span))
-
-
-def _schema_field_patch(key_canon: str, spec: Dict[str, Any]) -> str:
-    ty = spec.get("type", "ident")
-    if ty == "ident":
-        if "enum" in spec and spec["enum"]:
-            return f"{key_canon}: {spec['enum'][0]};"
-        if "in" in spec and spec["in"]:
-            return f"{key_canon}: {spec['in'][0]};"
-        return f"{key_canon}: SOME_IDENT;"
-    if ty == "string":
-        return f'{key_canon}: "...";'
-    if ty == "int":
-        lo = spec.get("min", 0)
-        return f"{key_canon}: {lo};"
-    if ty == "bool":
-        return f"{key_canon}: true;"
-    if ty == "list":
-        return f"{key_canon}: [ITEM];"
-    return f"{key_canon}: ...;"
-
-
-def _game_playbook_template(session_schema: Dict[str, Any]) -> str:
-    dsl = session_schema.get("dsl_name", "SessionDSL")
-    return (
-        "@PLAYBOOK {\n"
-        f"  session_dsl: {dsl};\n"
-        "  gameplan {\n"
-        "    # fill according to template printed by gen_game.py\n"
-        "  }\n"
-        "}\n"
+    *,
+    span=None,
+    context=None,
+    suggestions=None,
+) -> Diagnostic:
+    return Diagnostic(
+        code=code,
+        severity=Severity.ERROR,
+        message=message,
+        span=span,
+        context=context or {},
+        suggestions=suggestions or [],
     )
 
 
-def _gameplan_template(session_schema: Dict[str, Any]) -> str:
-    program_spec = session_schema.get("program", {})
-    block_schema = program_spec.get("block_schema", {})
-    required: Dict[str, Any] = block_schema.get("required", {})
-    lines = ["gameplan {"]
-    for k, spec in required.items():
-        lines.append(f"  {_schema_field_patch(k, spec)}")
-    lines.append("}")
-    return "\n".join(lines) + "\n"
+def validate_program(program: Program, *, schema: Schema = GPTLANG_V1_SCHEMA) -> CompilationResult:
+    diags: List[Diagnostic] = []
+    block_specs: Dict[str, BlockSpec] = {b.name: b for b in schema.blocks}
+
+    # -------------------------
+    # 1) Required blocks
+    # -------------------------
+    required_blocks = [b.name for b in schema.blocks if b.required]
+    for bname in required_blocks:
+        if not program.has_block(bname):
+            diags.append(
+                _diag(
+                    Err.E1000_MISSING_BLOCK,
+                    f"Missing required block @{bname}.",
+                    span=None,
+                    context={"required_blocks": required_blocks},
+                    suggestions=[f"Add a @{bname} block with keys: {', '.join(expected_fields(block_specs[bname]))}."],
+                )
+            )
+
+    # If blocks are missing, still continue to collect more errors where possible.
+
+    # -------------------------
+    # 2) Keys + type checks per block
+    # -------------------------
+    for bspec in schema.blocks:
+        block = program.block(bspec.name)
+        if block is None:
+            continue
+
+        fs_map = field_spec_map(bspec)
+
+        # Unknown keys (if not allowed by spec) — this is a validation-time policy
+        if not bspec.allow_extra_keys:
+            for key in block.kvs.keys():
+                if key not in fs_map:
+                    kv = block.kvs[key]
+                    diags.append(
+                        _diag(
+                            Err.E0001_UNEXPECTED,
+                            f"Unknown key '{key}' in @{bspec.name}.",
+                            span=kv.span or block.header_span,
+                            context={"block": bspec.name, "known_keys": list(fs_map.keys())},
+                            suggestions=["Fix the key name, or move it into the correct block."],
+                        )
+                    )
+
+        # Missing required keys
+        for fs in bspec.fields:
+            if fs.required and not block.has(fs.key):
+                diags.append(
+                    _diag(
+                        Err.E1001_MISSING_KEY,
+                        f"Missing required key '{fs.key}' in @{bspec.name}.",
+                        span=block.header_span,
+                        context={"block": bspec.name, "required_keys": [f.key for f in bspec.fields if f.required]},
+                        suggestions=[f"Add: {fs.key}: { _example_value(fs) }"],
+                    )
+                )
+
+        # Validate each present key that is in schema
+        for key, kv in block.kvs.items():
+            fs = fs_map.get(key)
+            if fs is None:
+                continue  # already flagged as unknown key if policy enabled
+
+            _validate_field(block_name=bspec.name, kv=kv, fs=fs, diags=diags)
+
+    # -------------------------
+    # 3) Cross-field conditional rules (v1)
+    # -------------------------
+    # RULES.tick_ms required if MECHANICS.loop == real_time
+    # RULES.max_turns required if MECHANICS.loop == turn_based
+    mechanics = program.block("MECHANICS")
+    rules = program.block("RULES")
+
+    loop_mode = None
+    if mechanics is not None:
+        v = mechanics.get("loop")
+        if v is not None and v.kind == ValueKind.IDENT:
+            loop_mode = v.value  # type: ignore[assignment]
+
+    if loop_mode is not None:
+        if rules is None:
+            # RULES required anyway; missing handled above. Don't double-report.
+            pass
+        else:
+            if loop_mode == "real_time":
+                if not rules.has("tick_ms"):
+                    diags.append(
+                        _diag(
+                            Err.E2000_MISSING_CONDITIONAL,
+                            "Missing required key 'tick_ms' in @RULES because MECHANICS.loop is real_time.",
+                            span=rules.header_span,
+                            context={"loop": "real_time"},
+                            suggestions=["Add: tick_ms: 100  # (16..1000)"],
+                        )
+                    )
+            if loop_mode == "turn_based":
+                if not rules.has("max_turns"):
+                    diags.append(
+                        _diag(
+                            Err.E2000_MISSING_CONDITIONAL,
+                            "Missing required key 'max_turns' in @RULES because MECHANICS.loop is turn_based.",
+                            span=rules.header_span,
+                            context={"loop": "turn_based"},
+                            suggestions=["Add: max_turns: 200  # (1..10000)"],
+                        )
+                    )
+
+    # OUTPUT.render policy (optional strictness)
+    output = program.block("OUTPUT")
+    if output is not None:
+        render = output.get("render")
+        if render is not None and render.kind == ValueKind.IDENT:
+            if render.value == "pygame":
+                # Hackathon default: allow but warn would be nicer; v1 uses errors only
+                # If you *do* support pygame generation, delete this block.
+                diags.append(
+                    _diag(
+                        Err.E2001_INCOMPATIBLE,
+                        "render: pygame is not supported in v1 codegen (use ascii).",
+                        span=(output.kvs.get("render").span if "render" in output.kvs else output.header_span),
+                        context={"render": "pygame"},
+                        suggestions=["Change to: render: ascii"],
+                    )
+                )
+
+    # CONSTRAINTS.no_network policy (optional)
+    constraints = program.block("CONSTRAINTS")
+    if constraints is not None:
+        nn = constraints.get("no_network")
+        if nn is not None and nn.kind == ValueKind.BOOL:
+            if nn.value is not True:
+                diags.append(
+                    _diag(
+                        Err.E2002_UNSAFE,
+                        "CONSTRAINTS.no_network must be true for this demo pipeline.",
+                        span=(constraints.kvs.get("no_network").span if "no_network" in constraints.kvs else constraints.header_span),
+                        suggestions=["Set: no_network: true"],
+                    )
+                )
+
+    ok = len([d for d in diags if d.severity == Severity.ERROR]) == 0
+    return CompilationResult(ok=ok, version=schema.version, errors=diags, ast=program if ok else None)
 
 
-# # ============================================================
-# # 5) Minimal usage example
-# # ============================================================
+# -------------------------
+# Field validation helpers
+# -------------------------
 
-# if __name__ == "__main__":
-#     from gptlang_parse import parse_gptlang
 
-#     main_src = r"""
-#     @VIBE_CHECK { title: "X"; patch: 1; mode: meta; }
-#     @WORLD_BUILD { setting: "Y"; loot: [BTC, ETH]; }
-#     @HOW_IT_HITS { turns: 50; moves: [trade]; dub_condition: "profit"; }
-#     @SHIP_IT { session_dsl: VibeExchangeSession; print_templates: true; }
-#     """
-#     pr = parse_gptlang(main_src, "main.llm")
-#     assert pr.ok and pr.file_ast
-#     print(validate_main_v1(pr.file_ast, "main.llm"))
+def _validate_field(*, block_name: str, kv: KeyValue, fs: FieldSpec, diags: List[Diagnostic]) -> None:
+    v = kv.value
 
-#     game_src = r"""
-#     @PLAYBOOK {
-#       session_dsl: VibeExchangeSession;
-#       gameplan {
-#         asset: BTC;
-#         risk: low;
-#       }
-#     }
-#     """
-#     pr2 = parse_gptlang(game_src, "game1.llm")
-#     assert pr2.ok and pr2.file_ast
-#     schema = {
-#         "dsl_name": "VibeExchangeSession",
-#         "program": {
-#             "required_block": CanonKey.STRATEGY.value,
-#             "block_schema": {
-#                 "required": {
-#                     "asset": {"type": "ident", "in": ["BTC", "ETH"]},
-#                     "risk": {"type": "ident", "enum": ["low", "med", "high"]},
-#                 },
-#                 "optional": {
-#                     "rule": {"type": "string"},
-#                 },
-#                 "strict_unknown_keys": False,
-#             },
-#         },
-#     }
-#     print(validate_game_v1(pr2.file_ast, schema, "game1.llm"))
+    # Type check
+    if v.kind != fs.kind:
+        diags.append(
+            _diag(
+                Err.E1100_WRONG_TYPE,
+                f"Wrong type for '{fs.key}' in @{block_name}: expected {fs.kind.value}, got {v.kind.value}.",
+                span=v.span or kv.span,
+                context={"block": block_name, "key": fs.key, "expected": fs.kind.value, "got": v.kind.value},
+                suggestions=[f"Use: {fs.key}: { _example_value(fs) }"],
+            )
+        )
+        return
+
+    # Non-empty checks
+    if fs.non_empty:
+        if v.kind == ValueKind.STRING:
+            if isinstance(v.value, str) and v.value.strip() == "":
+                diags.append(
+                    _diag(
+                        Err.E1300_OUT_OF_RANGE,
+                        f"'{fs.key}' in @{block_name} must be a non-empty string.",
+                        span=v.span or kv.span,
+                        suggestions=[f"Use: {fs.key}: \"...\""],
+                    )
+                )
+                return
+        if v.kind == ValueKind.LIST:
+            items = v.value  # type: ignore[assignment]
+            if isinstance(items, list) and len(items) == 0:
+                diags.append(
+                    _diag(
+                        Err.E1300_OUT_OF_RANGE,
+                        f"'{fs.key}' in @{block_name} must be a non-empty list.",
+                        span=v.span or kv.span,
+                        suggestions=[f"Use: {fs.key}: [{_example_list_item(fs)}]"],
+                    )
+                )
+                return
+
+    # Enum checks (IDENT)
+    if v.kind == ValueKind.IDENT and fs.enum is not None:
+        if v.value not in fs.enum:
+            diags.append(
+                _diag(
+                    Err.E1200_INVALID_ENUM,
+                    f"Invalid value for '{fs.key}' in @{block_name}: {v.value!r} is not allowed.",
+                    span=v.span or kv.span,
+                    context={"allowed": fs.enum},
+                    suggestions=[f"Use one of: {', '.join(fs.enum)}"],
+                )
+            )
+            return
+
+    # Int range checks
+    if v.kind == ValueKind.INT and fs.int_range is not None:
+        try:
+            iv = int(v.value)
+        except Exception:
+            diags.append(
+                _diag(
+                    Err.E1100_WRONG_TYPE,
+                    f"'{fs.key}' in @{block_name} must be an int.",
+                    span=v.span or kv.span,
+                )
+            )
+            return
+        if not fs.int_range.contains(iv):
+            diags.append(
+                _diag(
+                    Err.E1300_OUT_OF_RANGE,
+                    f"Out of range for '{fs.key}' in @{block_name}: {iv} not in { _range_str(fs.int_range) }.",
+                    span=v.span or kv.span,
+                    context={"min": fs.int_range.min, "max": fs.int_range.max},
+                    suggestions=[f"Use: {fs.key}: { _example_int_in_range(fs.int_range) }"],
+                )
+            )
+            return
+
+    # List item checks
+    if v.kind == ValueKind.LIST and fs.list_item_kind is not None:
+        items = v.value  # type: ignore[assignment]
+        if not isinstance(items, list):
+            # should not happen if parser is correct
+            diags.append(
+                _diag(
+                    Err.E1100_WRONG_TYPE,
+                    f"'{fs.key}' in @{block_name} must be a list.",
+                    span=v.span or kv.span,
+                )
+            )
+            return
+
+        for item in items:
+            if not isinstance(item, Value):
+                continue
+            if item.kind != fs.list_item_kind:
+                diags.append(
+                    _diag(
+                        Err.E1100_WRONG_TYPE,
+                        f"Wrong item type in list '{fs.key}' in @{block_name}: expected {fs.list_item_kind.value}, got {item.kind.value}.",
+                        span=item.span or v.span or kv.span,
+                        context={"expected": fs.list_item_kind.value, "got": item.kind.value},
+                        suggestions=[f"Example: {fs.key}: [{_example_list_item(fs)}]"],
+                    )
+                )
+                return
+
+            if fs.list_item_kind == ValueKind.IDENT and fs.list_item_enum is not None:
+                if item.value not in fs.list_item_enum:
+                    diags.append(
+                        _diag(
+                            Err.E1200_INVALID_ENUM,
+                            f"Invalid action in '{fs.key}' in @{block_name}: {item.value!r} is not allowed.",
+                            span=item.span or v.span or kv.span,
+                            context={"allowed": fs.list_item_enum},
+                            suggestions=[f"Use only: {', '.join(fs.list_item_enum)}"],
+                        )
+                    )
+                    return
+
+
+# -------------------------
+# Example formatting helpers
+# -------------------------
+
+
+def _range_str(r: Range) -> str:
+    lo = "-inf" if r.min is None else str(r.min)
+    hi = "+inf" if r.max is None else str(r.max)
+    return f"[{lo}..{hi}]"
+
+
+def _example_int_in_range(r: Range) -> int:
+    if r.min is not None:
+        return r.min
+    if r.max is not None:
+        return r.max
+    return 0
+
+
+def _example_list_item(fs: FieldSpec) -> str:
+    if fs.list_item_enum:
+        return fs.list_item_enum[0]
+    if fs.list_item_kind == ValueKind.IDENT:
+        return "move"
+    if fs.list_item_kind == ValueKind.STRING:
+        return "\"x\""
+    if fs.list_item_kind == ValueKind.INT:
+        return "0"
+    if fs.list_item_kind == ValueKind.BOOL:
+        return "true"
+    return "item"
+
+
+def _example_value(fs: FieldSpec) -> str:
+    if fs.kind == ValueKind.STRING:
+        return "\"...\""
+    if fs.kind == ValueKind.INT:
+        if fs.int_range is not None:
+            return str(_example_int_in_range(fs.int_range))
+        return "0"
+    if fs.kind == ValueKind.BOOL:
+        return "true"
+    if fs.kind == ValueKind.IDENT:
+        if fs.enum:
+            return fs.enum[0]
+        return "ident_value"
+    if fs.kind == ValueKind.LIST:
+        item = _example_list_item(fs)
+        return f"[{item}]"
+    if fs.kind == ValueKind.MAP:
+        return "{ key: \"value\" }"
+    return "value"

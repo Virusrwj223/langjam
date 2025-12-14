@@ -1,164 +1,143 @@
-# compile.py (patch)
+# gptlang_compile.py (UPDATED)
+
 from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
-from dotenv import load_dotenv
+import os
+import sys
+from dataclasses import dataclass
+from typing import Optional
 
-from llm_client import LLMClient, LLMConfig
-from llm_modes import llm_codegen, llm_diagnostics, llm_repair
-from gptlang_parse import parse_gptlang
-from gptlang_validate import validate_main_v1, validate_game_v1
+from gptlang_parse import parse_file
+from gptlang_validate import validate_program
+from gptlang_prompts import diagnostics_prompt, codegen_prompt
+from openrouter_client import config_from_env, chat_completion, OpenRouterError
 
-def python_compile_check(code: str) -> tuple[bool, str | None]:
+
+@dataclass
+class CompileOptions:
+    out_py_name: str = "gen_game.py"
+    http_referer: Optional[str] = None
+    x_title: Optional[str] = "GPTLANG Compiler"
+
+
+def _print_diagnostics_json(diags) -> None:
+    payload = {
+        "ok": False,
+        "version": "gptlang-v1",
+        "errors": [d.to_dict() for d in diags],
+    }
+    sys.stderr.write(json.dumps(payload, indent=2) + "\n")
+
+
+def _find_single_llm_file(dir_path: str) -> str:
+    files = [f for f in os.listdir(dir_path) if f.endswith(".llm")]
+    if len(files) == 0:
+        raise RuntimeError("No .llm file found in directory.")
+    if len(files) > 1:
+        raise RuntimeError(f"Multiple .llm files found: {files}. Only one is allowed.")
+    return os.path.join(dir_path, files[0])
+
+
+def compile_project(project_dir: str, *, opts: CompileOptions) -> int:
+    if not os.path.isdir(project_dir):
+        sys.stderr.write(f"Not a directory: {project_dir}\n")
+        return 2
+
     try:
-        compile(code, "<generated>", "exec")
-        return True, None
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        llm_path = _find_single_llm_file(project_dir)
+    except RuntimeError as e:
+        sys.stderr.write(str(e) + "\n")
+        return 2
 
-def make_llm_client() -> tuple[LLMClient, str]:
-    import os
-    provider = os.getenv("LLM_PROVIDER")
-    model = os.getenv("LLM_MODEL")
-    if not provider or not model:
-        raise RuntimeError("Missing LLM_PROVIDER or LLM_MODEL in .env")
+    out_py_path = os.path.join(project_dir, opts.out_py_name)
 
-    if provider == "openrouter":
-        base = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-        return (
-            LLMClient(LLMConfig(base_url=base, api_key_env="OPENROUTER_API_KEY", default_model=model)),
-            model
+    # -------------------------
+    # Phase 1: Parse
+    # -------------------------
+    parse_res = parse_file(llm_path)
+    if not parse_res.ok:
+        _print_diagnostics_json(parse_res.errors)
+        _explain_with_gpt(parse_res.errors, opts)
+        return 1
+
+    # -------------------------
+    # Phase 2: Validate
+    # -------------------------
+    val_res = validate_program(parse_res.ast)  # type: ignore[arg-type]
+    if not val_res.ok:
+        _print_diagnostics_json(val_res.errors)
+        _explain_with_gpt(val_res.errors, opts)
+        return 1
+
+    # -------------------------
+    # Phase 3: Codegen (GPT)
+    # -------------------------
+    try:
+        cfg = config_from_env(http_referer=opts.http_referer, x_title=opts.x_title)
+        py_code = chat_completion(
+            cfg=cfg,
+            messages=codegen_prompt(val_res.ast.to_dict()),  # type: ignore[union-attr]
+            temperature=0.2,
+            max_tokens=3000,
         )
+    except OpenRouterError as e:
+        sys.stderr.write(f"OpenRouter error: {e}\n")
+        return 3
 
-    if provider == "groq":
-        base = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
-        return (
-            LLMClient(LLMConfig(base_url=base, api_key_env="GROQ_API_KEY", default_model=model)),
-            model
-        )
+    if "def main" not in py_code or "__name__" not in py_code:
+        sys.stderr.write("Codegen failed: missing main() or __name__ guard.\n")
+        return 4
 
-    raise RuntimeError(f"Unknown LLM_PROVIDER={provider}")
+    with open(out_py_path, "w", encoding="utf-8") as f:
+        f.write(py_code.rstrip() + "\n")
 
-def compile_main(main_llm: Path, out_py: Path) -> int:
-    src = main_llm.read_text(encoding="utf-8")
-
-    pr = parse_gptlang(src, source_name=str(main_llm))
-    if not pr.ok or pr.file_ast is None:
-        print(json.dumps({
-            "ok": False,
-            "stage": "parse",
-            "file": str(main_llm),
-            "diagnostics": [d.__dict__ for d in pr.diagnostics],
-        }, indent=2))
-        return 1
-
-    vj = validate_main_v1(pr.file_ast, source_name=str(main_llm))
-    if not vj["ok"]:
-        client, _ = make_llm_client()
-        expl = llm_diagnostics(client, src, vj)
-        print(json.dumps(expl, indent=2))
-        return 1
-
-    client, _ = make_llm_client()
-    py = llm_codegen(client, stage="meta", source_text=src, validated_info=vj)
-
-    ok, err = python_compile_check(py)
-    attempts = 0
-    while not ok and attempts < 2:
-        py = llm_repair(client, py, err or "unknown error")
-        ok, err = python_compile_check(py)
-        attempts += 1
-
-    if not ok:
-        print(json.dumps({
-            "ok": False,
-            "stage": "py_compile",
-            "file": str(out_py),
-            "diagnostics": [{"code": "E3001", "severity": "error", "message": err, "span": None}],
-        }, indent=2))
-        return 1
-
-    out_py.write_text(py, encoding="utf-8")
-    print(json.dumps({"ok": True, "stage": "emit", "file": str(out_py)}, indent=2))
+    print(f"OK: generated {out_py_path}")
     return 0
 
-def compile_game(game_llm: Path, schema_json: Path, out_py: Path) -> int:
-    src = game_llm.read_text(encoding="utf-8")
-    schema = json.loads(schema_json.read_text(encoding="utf-8"))
 
-    pr = parse_gptlang(src, source_name=str(game_llm))
-    if not pr.ok or pr.file_ast is None:
-        print(json.dumps({
-            "ok": False,
-            "stage": "parse",
-            "file": str(game_llm),
-            "diagnostics": [d.__dict__ for d in pr.diagnostics],
-        }, indent=2))
-        return 1
+def _explain_with_gpt(errors, opts: CompileOptions) -> None:
+    try:
+        cfg = config_from_env(http_referer=opts.http_referer, x_title=opts.x_title)
+        msg = chat_completion(
+            cfg=cfg,
+            messages=diagnostics_prompt([e.to_dict() for e in errors]),
+            temperature=0.2,
+            max_tokens=1200,
+        )
+        sys.stderr.write("\n=== GPT Diagnostics Explanation ===\n")
+        sys.stderr.write(msg.strip() + "\n")
+    except Exception:
+        pass  # Diagnostics must never depend on GPT availability
 
-    vj = validate_game_v1(pr.file_ast, session_schema=schema, source_name=str(game_llm))
-    if not vj["ok"]:
-        client, _ = make_llm_client()
-        expl = llm_diagnostics(client, src, vj)
-        print(json.dumps(expl, indent=2))
-        return 1
 
-    client, _ = make_llm_client()
-    py = llm_codegen(client, stage="game", source_text=src, validated_info=vj)
+def _build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="gptlangc",
+        description="GPTLANG v1 compiler: <project_dir> -> <project_dir>/gen_game.py",
+    )
+    p.add_argument("project_dir", help="Directory containing exactly one .llm file")
+    p.add_argument(
+        "-o",
+        "--out-name",
+        default="main.py",
+        help="Output Python filename (inside project dir)",
+    )
+    p.add_argument("--http-referer", default=None)
+    p.add_argument("--x-title", default="GPTLANG Compiler")
+    return p
 
-    ok, err = python_compile_check(py)
-    attempts = 0
-    while not ok and attempts < 2:
-        py = llm_repair(client, py, err or "unknown error")
-        ok, err = python_compile_check(py)
-        attempts += 1
 
-    if not ok:
-        print(json.dumps({
-            "ok": False,
-            "stage": "py_compile",
-            "file": str(out_py),
-            "diagnostics": [{"code": "E3001", "severity": "error", "message": err, "span": None}],
-        }, indent=2))
-        return 1
+def main(argv: Optional[list[str]] = None) -> int:
+    args = _build_argparser().parse_args(argv)
+    opts = CompileOptions(
+        out_py_name=args.out_name,
+        http_referer=args.http_referer,
+        x_title=args.x_title,
+    )
+    return compile_project(args.project_dir, opts=opts)
 
-    out_py.write_text(py, encoding="utf-8")
-    print(json.dumps({"ok": True, "stage": "emit", "file": str(out_py)}, indent=2))
-    return 0
-
-def main() -> None:
-    ROOT = Path(__file__).resolve().parent
-    load_dotenv(ROOT / ".env")
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dir", default="llm", help="Directory containing .llm files (and outputs).")
-
-    sub = ap.add_subparsers(dest="cmd", required=True)
-
-    a = sub.add_parser("meta")
-    a.add_argument("--in", dest="in_name", default="main.llm", help="Input .llm filename inside --dir")
-    a.add_argument("--out", dest="out_name", default="main.py", help="Output .py filename inside --dir")
-
-    b = sub.add_parser("game")
-    b.add_argument("--in", dest="in_name", default="game1.llm", help="Input .llm filename inside --dir")
-    b.add_argument("--schema", dest="schema_name", default="session_schema.json", help="Schema JSON filename inside --dir")
-    b.add_argument("--out", dest="out_name", default="play_game1.py", help="Output .py filename inside --dir")
-
-    args = ap.parse_args()
-    llm_dir = Path(args.dir)
-    llm_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.cmd == "meta":
-        main_llm = llm_dir / args.in_name
-        out_py = llm_dir / args.out_name
-        raise SystemExit(compile_main(main_llm, out_py))
-    else:
-        game_llm = llm_dir / args.in_name
-        schema_json = llm_dir / args.schema_name
-        out_py = llm_dir / args.out_name
-        raise SystemExit(compile_game(game_llm, schema_json, out_py))
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
