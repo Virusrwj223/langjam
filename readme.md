@@ -4,6 +4,20 @@ GPTLANG v1 is a **GPT-first programming language** for describing small games in
 
 ---
 
+## Project Setup
+
+Activate the virtual environment and install the requirements.
+
+```
+python -m venv env
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+API keys to connect to OpenRouter has been intentionally provided to fascilitate testing.
+
+---
+
 ## File & Folder Convention
 
 The compiler expects a **project folder** containing **exactly one** `.llm` file:
