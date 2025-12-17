@@ -1,0 +1,33 @@
+@INTENT
+title: "Brainrot Mental Sums: 67 Mode"
+patch: 1
+mode: grindset_runner
+audience_vibe: sweaty
+
+@WORLD
+setting: "A neon study room where every correct sum gives you +vibes"
+tone: absurd
+seed: 67
+
+@MECHANICS
+genre: arcade
+loop: turn_based
+player_hp: 5
+win_condition: score_threshold
+lose_condition: hp_zero
+
+@RULES
+actions: [interact, wait]
+max_turns: 25
+difficulty: normal
+
+@OUTPUT
+target: python
+entrypoint: main
+render: ascii
+logging: true
+
+@CONSTRAINTS
+no_network: true
+max_loc: 700
+max_runtime_s: 15
